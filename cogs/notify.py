@@ -11,7 +11,7 @@ from discord.ext import commands, tasks
 
 log = logging.getLogger(__name__)
 
-WIKI_URL = "https://wikiwiki.jp/star-rail/%E3%82%A4%E3%83%99%E3%83%B3%E3%83%88"
+GAME8_URL = "https://game8.jp/houkaistarrail/525554"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,9 +23,10 @@ HEADERS = {
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 EVENTS_FILE = os.path.join(DATA_DIR, "events.json")
 NOTIFY_CHANNEL_ID = int(os.getenv("NOTIFY_CHANNEL_ID", "0"))
-DATE_FMT = "%Y/%m/%d"
+DATE_FMT = "%Y/%m/%d %H:%M"
+# game8 形式: 【開催期間】 M/DD HH:MM 〜M/DD HH:MM
 PERIOD_RE = re.compile(
-    r"(\d{4}/\d{2}/\d{2})\s*[~〜]\s*(\d{4}/\d{2}/\d{2})"
+    r"【開催期間】\s*(\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2})\s*[〜~]\s*(\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2})"
 )
 MIN_NOTIFY_DATE = datetime.datetime(2026, 6, 1)
 
@@ -43,10 +44,19 @@ def _save_events(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _add_year(raw: str) -> datetime.datetime:
+    """M/D HH:MM 形式に年を付与して返す。30日以上過去なら翌年扱い"""
+    now = datetime.datetime.now()
+    dt = datetime.datetime.strptime(f"{now.year}/{raw.strip()}", "%Y/%m/%d %H:%M")
+    if dt < now - datetime.timedelta(days=30):
+        dt = dt.replace(year=now.year + 1)
+    return dt
+
+
 def _fetch_events() -> list:
-    """wikiwikiから限定イベントを取得する"""
+    """game8から開催中のイベントを取得する"""
     try:
-        res = requests.get(WIKI_URL, headers=HEADERS, timeout=15)
+        res = requests.get(GAME8_URL, headers=HEADERS, timeout=15)
         res.raise_for_status()
         res.encoding = "utf-8"
     except requests.RequestException as e:
@@ -54,71 +64,63 @@ def _fetch_events() -> list:
         return []
 
     soup = BeautifulSoup(res.text, "html.parser")
+
+    heading = soup.find(
+        lambda tag: tag.name in ("h2", "h3", "h4") and "開催中のイベント" in tag.get_text()
+    )
+    if heading is None:
+        log.warning("「開催中のイベント」セクションが見つかりませんでした")
+        return []
+
+    table = heading.find_next("table")
+    if table is None:
+        log.warning("イベントテーブルが見つかりませんでした")
+        return []
+
     events = []
     seen_names = set()
-    in_limited_section = False
 
-    all_elements = soup.find_all(["h2", "h3", "h4", "h5", "table"])
-
-    for elem in all_elements:
-        if elem.name in ("h2", "h3", "h4", "h5"):
-            text = elem.get_text(strip=True)
-            if "限定イベント" in text:
-                in_limited_section = True
-            elif in_limited_section:
-                # 同レベル以上の別セクションに入ったらリセット
-                in_limited_section = False
+    for row in table.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 2:
             continue
 
-        if elem.name != "table" or not in_limited_section:
+        # イベント名: 最初のセル内のリンクテキスト（画像のみの場合はalt属性）
+        name_cell = cells[0]
+        link = name_cell.find("a")
+        if link:
+            name = link.get_text(strip=True)
+            if not name:
+                img = link.find("img")
+                name = img.get("alt", "").strip() if img else ""
+        else:
+            name = name_cell.get_text(strip=True)
+
+        if not name or name in seen_names:
             continue
 
-        header_row = elem.find("tr")
-        if not header_row:
+        # 全セルから【開催期間】パターンを検索
+        period_text = " ".join(c.get_text(" ", strip=True) for c in cells)
+        match = PERIOD_RE.search(period_text)
+        if not match:
             continue
 
-        headers = header_row.find_all(["th", "td"])
-        name_col = next(
-            (i for i, h in enumerate(headers) if "イベント名" in h.get_text()), None
-        )
-        period_col = next(
-            (i for i, h in enumerate(headers) if "開催期間" in h.get_text()), None
-        )
-
-        if name_col is None or period_col is None:
+        try:
+            start_dt = _add_year(match.group(1))
+            end_dt = _add_year(match.group(2))
+        except ValueError:
             continue
 
-        for row in elem.find_all("tr")[1:]:
-            cells = row.find_all(["td", "th"])
-            if len(cells) <= max(name_col, period_col):
-                continue
+        if end_dt < datetime.datetime.now():
+            continue
 
-            period_text = cells[period_col].get_text(strip=True)
-            match = PERIOD_RE.search(period_text)
-            if not match:
-                continue
-
-            start_str = match.group(1).strip()
-            end_str = match.group(2).strip()
-
-            name_cell = cells[name_col]
-            link = name_cell.find("a")
-            name = link.get_text(strip=True) if link else name_cell.get_text(strip=True)
-
-            if not name or name in seen_names:
-                continue
-
-            try:
-                end_dt = datetime.datetime.strptime(end_str, DATE_FMT)
-                start_dt = datetime.datetime.strptime(start_str, DATE_FMT)
-            except ValueError:
-                continue
-
-            if end_dt < datetime.datetime.now():
-                continue
-
-            seen_names.add(name)
-            events.append({"name": name, "start": start_str, "end": end_str, "start_dt": start_dt})
+        seen_names.add(name)
+        events.append({
+            "name": name,
+            "start": start_dt.strftime(DATE_FMT),
+            "end": end_dt.strftime(DATE_FMT),
+            "start_dt": start_dt,
+        })
 
     log.info("%d 件のイベントを検出: %s", len(events), [e["name"] for e in events])
     return events
